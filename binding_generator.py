@@ -1,25 +1,44 @@
-from email.policy import default
 import json
-import re
-from enum import Enum
-
-# builtin_classes = []
 
 builtin_sizes = {}
 
 
 def fill_builtin_sizes(api, build_config):
+    """
+    Fills the builtin sizes global dict
+    """
     global builtin_sizes
     for size_list in api["builtin_class_sizes"]:
         if size_list["build_configuration"] == build_config:
             for size in size_list["sizes"]:
-                builtin_sizes[transform_type_name(size["name"])] = size["size"]
+                builtin_sizes[size["name"]] = size["size"]
             break
 
-# # Key is class name, value is boolean where True means the class is refcounted.
-# engine_classes = {}
 
-# singletons = []
+def get_default_float_type():
+    """
+    The default type of a "float" if there is no meta
+    """
+    size = builtin_sizes["float"]
+    if size == 8:
+        return "f64"
+    elif size == 4:
+        return "f32"
+    else:
+        assert(False)
+
+
+def get_default_int_type():
+    """
+    The default type of a "int" if there is no meta
+    """
+    size = builtin_sizes["int"]
+    if size == 8:
+        return "i64"
+    elif size == 4:
+        return "i32"
+    else:
+        assert(False)
 
 
 def generate_bindings(api_filepath, bits="64", double="float", output_dir="."):
@@ -81,9 +100,15 @@ def generate_globals():
     result.append("// Interface")
     result.append("var g_interface: ?c.GDNativeInterface = null;")
     result.append(
-        "pub fn initInterface(interface: c.GDNativeInterface) void { g_interface = interface; }")
+        "pub fn initInterface(interface: c.GDNativeInterface) void {")
+    result.append("\tg_interface = interface;")
+    result.append("\tinitUtilBindings();")
+    result.append("}")
     result.append(
-        "pub fn deinitInterface() void { g_interface = null; }")
+        "pub fn deinitInterface() void {")
+    result.append("\tdeinitUtilBindings();")
+    result.append("\tg_interface = null;")
+    result.append("}")
     result.append(
         "fn get_interface() *const c.GDNativeInterface { return &(g_interface orelse unreachable); }")
     result.append("")
@@ -136,9 +161,9 @@ def genereate_builtins(api):
     result.append("")
 
     for builtin in api["builtin_classes"]:
-        name = transform_type_name(builtin["name"])
-        size = builtin_sizes[name]
-        if is_pod_type(name):
+        name = parse_type(builtin["name"])
+        size = builtin_sizes[builtin["name"]]
+        if is_pod_type(builtin["name"]):
             continue
 
         result.append("pub const " + name + " = extern struct {")
@@ -165,7 +190,7 @@ def genereate_builtins(api):
                 args = make_argument_array(arguments)
                 result.append("\t\t" + args + ";")
 
-                result.append("\t\tvar self = .{ .inner = undefined };")
+                result.append("\t\tvar self = undefined;")
                 result.append(
                     f"\t\t(get_bindings().{constructor_name})(&self, &args);")
                 result.append("\t\treturn self;")
@@ -258,8 +283,13 @@ def genereate_builtins(api):
 def genereate_classes(api):
     result = []
 
+    result.append("///////////////////////")
+    result.append("// Classes ////////////")
+    result.append("///////////////////////")
+    result.append("")
+
     for class_api in api["classes"]:
-        name = transform_type_name(class_api["name"])
+        name = parse_type(class_api["name"])
         result.append("pub const " + name + " = struct {")
         result.append("\tinner: c.GDNativeObjectPtr,")
         result.append("")
@@ -370,12 +400,62 @@ def genereate_classes(api):
 
 def generate_utility(api):
     result = []
+
+    result.append("///////////////////////")
+    result.append("// Utils //////////////")
+    result.append("///////////////////////")
+    result.append("")
+
+    bindings = []
     for function in api["utility_functions"]:
-        name = function["name"]
-        return_type = function["return_type"] if "return_type" in function else None
-        arguments = function["arguments"] if "arguments" in function else []
-        proto = make_function_proto(name, return_type, arguments)
-        result.append("pub " + proto + " { return unreachable; }")
+        function_name, return_type, arguments = parse_function(function)
+
+        bindings.append(f"{function_name}: c.GDNativePtrUtilityFunction")
+
+        proto = make_function_proto(function_name, return_type, arguments)
+        result.append("pub " + proto + " {")
+
+        args = make_argument_array(arguments)
+        result.append("\t" + args + ";")
+
+        arg_count = len(arguments)
+
+        return_var = make_return(return_type)
+        result.append("\t\t" + return_var + ";")
+
+        result.append(
+            f"\t(get_util_bindings().{function_name})(&_return, &args, {arg_count});")
+
+        if return_type != None:
+            result.append("\treturn _return;")
+
+        result.append("}")
+
+    def addtab(s):
+        return "\t" + s
+
+    result.append("const UtilBindings = struct {")
+    result.append(",\n".join(map(addtab, bindings)))
+    result.append("};")
+
+    result.append("var g_util_bindings: ?UtilBindings = null;")
+    result.append("fn initUtilBindings() void {")
+    result.append("\tconst interface = get_interface();")
+    result.append("\tg_util_bindings = .{")
+
+    for function in api["utility_functions"]:
+        function_name = function["name"]
+        function_hash = function["hash"]
+        result.append(
+            f"\t\t.{function_name} = interface.variant_get_ptr_utility_function(\"{function_name}\", {function_hash}),")
+
+    result.append("\t};")
+    result.append("}")
+
+    result.append("fn deinitUtilBindings() void { g_util_bindings = null; }")
+    result.append(
+        "fn get_util_bindings() *UtilBindings { return &(g_util_bindings orelse unreachable); }")
+
     result.append("")
     return result
 
@@ -391,12 +471,6 @@ def generate_footer():
 
 
 def strip_enum_name(enum: str, member: str):
-    # components = member.split("_")
-
-    # index = 0
-    # for component in components:
-    #     for letter in component:
-    #         if len(enum) > index:
     return member
 
 
@@ -421,7 +495,7 @@ def make_function_proto(name, return_type, arguments, self=None, is_const=False)
         if len(parameter_name) == 0:
             parameter_name = "arg_" + str(index + 1)
 
-        if param_pass_by_ptr(param_type):
+        if param_pass_by_ptr(par["type"]):
             signature.append(f"{parameter_name}: *{param_type}")
         else:
             signature.append(f"{parameter_name}: {param_type}")
@@ -490,7 +564,27 @@ def parse_method(method):
     return method_name, return_type, arguments, is_const
 
 
+def parse_function(function):
+    function_name = function["name"]
+
+    return_type = None
+    if "return_type" in function:
+        return_type = parse_type(function["return_type"])
+    if "return_value" in function:
+        return_type = function["return_value"]["type"]
+        return_meta = function["return_value"]["meta"] if "meta" in function["return_value"] else None
+        return_type = parse_type(return_type, return_meta)
+
+    arguments = function["arguments"] if "arguments" in function else []
+    return function_name, return_type, arguments
+
+
 def parse_type(name: str, meta=None):
+    """
+    Parses a type name. These are found in a variety of places in the extension_api.json, 
+    including parameter types, return types, properties, and the names of classes and builtins.
+    """
+    # Strip prefixes
     name = name.replace("bitfield::", "")
     name = name.replace("enum::", "")
 
@@ -499,9 +593,9 @@ def parse_type(name: str, meta=None):
             if name == "void":
                 return "anyopaque"
             elif name == "float":
-                return "f64"
+                return get_default_float_type()
             elif name == "int":
-                return "i64"
+                return get_default_int_type()
             elif name == "bool":
                 return "bool"
             elif name == "Nil":
@@ -639,9 +733,9 @@ def convert_name_to_variant_type(name: str) -> str:
 def is_pod_type(type_name):
     return type_name in [
         "Nil",
-        "Bool",
-        "Float",
-        "Int",
+        "bool",
+        "float",
+        "int",
         "Vector2",
         "Vector2i",
         "Rect2",
@@ -659,11 +753,6 @@ def is_pod_type(type_name):
         "Projection",
         "Color",
     ]
-
-
-#######################################
-## Name Transforming Funcs ############
-#######################################
 
 
 def escape_identifier(id):
@@ -689,61 +778,6 @@ def escape_identifier(id):
     return id
 
 
-def transform_variable_name(name: str):
-    if name.startswith("gd_"):
-        return name
-    return "gd_" + name
-
-
-def type_name_with_meta(name, meta):
-    if name == "int":
-        match meta:
-            case "int8": return "i8"
-            case "int16": return "i16"
-            case "int32": return "i32",
-            case "int64": return "i64"
-            case other: raise AssertionError()
-    if name == "float":
-        match meta:
-            case "float": return "Float"
-            case other: raise AssertionError()
-
-    raise AssertionError()
-
-
-def transform_type_name(type_name):
-    def transform(name):
-        if name == "void":
-            return "anyopaque"
-        elif name == "float":
-            return "Float"
-        elif name == "int":
-            return "Int"
-        elif name == "bool":
-            return "Bool"
-        else:
-            return name
-
-    is_const = False
-    if type_name.startswith("const "):
-        is_const = True
-        type_name = type_name[6:]
-
-    if type_name.endswith("**"):
-        if is_const:
-            return "**const " + transform(type_name[0:-2])
-        else:
-            return "**" + transform(type_name[0: -2])
-
-    if type_name.endswith("*"):
-        if is_const:
-            return "*const " + transform(type_name[0:-1])
-        else:
-            return "*" + transform(type_name[0: -1])
-
-    return transform(type_name)
-
-
 def to_camel_case(snake_str: str):
     """
     Converts snake_str to camel case
@@ -761,11 +795,6 @@ def to_camel_case(snake_str: str):
         return result[0].lower() + result[1:]
     else:
         return result.lower()
-
-
-def to_snake_case(name):
-    name = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
-    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', name).lower()
 
 
 ################################
